@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
-"""Cutest picture v3: one big cream kitten face, drawn better.
+"""Cutest picture v4 — one big cream kitten face, painted from scratch.
 
-The program draws the picture itself (no bundled image, no network, no
-third-party libraries) and writes it deterministically to
-$MAKEFUN_OUTPUT_DIR/entry.png (default /output/entry.png).
+The program paints a single picture onto a 512x512 canvas and writes it as
+a PNG. The subject is one large cream kitten face filling the frame: two
+triangular ears (the left one a little higher, for a gentle head tilt), two
+big bright blue eyes, a tiny pink nose, a small "w" mouth, soft pink blush
+cheeks, thin whiskers and one small pink bow at the base of the right ear.
+The background is a plain pink-to-cream gradient, so nothing crowds the
+subject and it still reads clearly when shown small.
 
-Lesson from v1 and v2: v1 (one big kitten face, pink bow) scored 73.6%;
-v2 (kitten hugging a chick, two subjects) scored 66.5% — the second
-subject crowded the frame and hurt "reads small" and clean craft. So v3
-goes back to ONE large subject filling the frame, and spends the effort
-on making that one face better: bigger bright blue eyes, a gentle head
-tilt, a soft smile, one tiny pink bow only, and soft radial shading on
-the fur for depth (darker rim, gentle top-left light).
-
-Technique: a small scanline rasteriser draws filled ellipses, polygons and
-thick lines into a 2x supersampled framebuffer, which is then box-downsampled
-to 512x512 for smooth edges. The PNG is encoded by hand with zlib+struct.
+Everything is drawn with the Python standard library only. The run is fully
+deterministic: no randomness, no clock, no network, so running it twice
+produces byte-identical output.
 """
 
 import math
@@ -23,273 +19,322 @@ import os
 import struct
 import zlib
 
-W = H = 512
-SS = 2  # supersampling factor
-SW, SH = W * SS, H * SS
+# ---------------------------------------------------------------------------
+# Canvas size and palette
+# ---------------------------------------------------------------------------
 
-# Framebuffer: RGB bytes at supersampled resolution.
-buf = bytearray(SW * SH * 3)
+SIZE = 512
 
+BG_TOP = (250, 226, 233)      # pale pink at the top of the background
+BG_BOTTOM = (253, 245, 232)   # pale cream at the bottom
+FACE_CREAM = (250, 238, 211)  # main fur colour
+FACE_LIGHT = (255, 248, 232)  # soft highlight on the fur
+FACE_RIM = (232, 205, 170)    # faint darker tone near the fur's edge
+OUTLINE = (206, 162, 118)     # warm tan outline of the face and ears
+INNER_EAR = (246, 172, 186)   # pink inside the ears
+EYE_RIM = (74, 48, 36)        # dark brown ring around each eye
+IRIS = (72, 166, 218)         # bright blue iris
+PUPIL = (48, 34, 30)          # dark pupil
+HIGHLIGHT = (255, 255, 255)   # white sparkle in the eyes
+NOSE = (238, 128, 148)        # pink nose
+MOUTH = (90, 60, 48)          # dark brown mouth line
+BLUSH = (245, 175, 190)       # pink blush
+WHISKER = (198, 162, 118)     # tan whiskers
+BOW = (238, 108, 144)         # pink bow
+BOW_KNOT = (224, 84, 122)     # slightly deeper pink for the bow knot
 
-def _blend(x, y, r, g, b, a):
-    """Blend one supersampled pixel. a is 0..255."""
-    if a <= 0 or x < 0 or y < 0 or x >= SW or y >= SH:
-        return
-    i = (y * SW + x) * 3
-    if a >= 255:
-        buf[i] = r
-        buf[i + 1] = g
-        buf[i + 2] = b
-    else:
-        buf[i] = (r * a + buf[i] * (255 - a)) // 255
-        buf[i + 1] = (g * a + buf[i + 1] * (255 - a)) // 255
-        buf[i + 2] = (b * a + buf[i + 2] * (255 - a)) // 255
-
-
-def _span(x0, x1, y, r, g, b, a):
-    """Fill a horizontal run of supersampled pixels (inclusive)."""
-    if y < 0 or y >= SH or x1 < 0 or x0 >= SW:
-        return
-    x0 = max(0, x0)
-    x1 = min(SW - 1, x1)
-    if x0 > x1:
-        return
-    i0 = (y * SW + x0) * 3
-    i1 = (y * SW + x1 + 1) * 3
-    if a >= 255:
-        buf[i0:i1] = bytes((r, g, b)) * (x1 - x0 + 1)
-    else:
-        for x in range(x0, x1 + 1):
-            _blend(x, y, r, g, b, a)
+FACE_CX, FACE_CY = 256, 272
+FACE_R = 185
 
 
-def fill_ellipse(cx, cy, rx, ry, color, alpha=255):
-    """Filled ellipse, logical (512-space) coordinates."""
-    cx, cy, rx, ry = cx * SS, cy * SS, rx * SS, ry * SS
-    r, g, b = color
-    y0 = max(0, int(math.ceil(cy - ry)))
-    y1 = min(SH - 1, int(math.floor(cy + ry)))
-    for y in range(y0, y1 + 1):
-        dy = (y + 0.5 - cy) / ry
-        t = 1.0 - dy * dy
-        if t <= 0:
-            continue
-        dx = rx * math.sqrt(t)
-        _span(int(math.ceil(cx - dx)), int(math.floor(cx + dx)), y, r, g, b, alpha)
+# ---------------------------------------------------------------------------
+# Small numeric helpers
+# ---------------------------------------------------------------------------
+
+def clamp01(value):
+    """Clamp a number into [0, 1]."""
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
 
 
-def fill_circle(cx, cy, rad, color, alpha=255):
-    fill_ellipse(cx, cy, rad, rad, color, alpha)
+def smoothstep(edge0, edge1, value):
+    """Smooth 0 -> 1 ramp between edge0 and edge1."""
+    t = clamp01((value - edge0) / (edge1 - edge0))
+    return t * t * (3.0 - 2.0 * t)
 
 
-def fill_poly(points, color, alpha=255):
-    """Filled polygon, logical coordinates. Points: list of (x, y)."""
-    pts = [(x * SS, y * SS) for x, y in points]
-    r, g, b = color
-    ys = [p[1] for p in pts]
-    y0 = max(0, int(math.ceil(min(ys))))
-    y1 = min(SH - 1, int(math.floor(max(ys))))
-    n = len(pts)
-    for y in range(y0, y1 + 1):
-        yc = y + 0.5
-        xs = []
-        for i in range(n):
-            x1, y1p = pts[i]
-            x2, y2p = pts[(i + 1) % n]
-            if (y1p <= yc < y2p) or (y2p <= yc < y1p):
-                xs.append(x1 + (yc - y1p) * (x2 - x1) / (y2p - y1p))
-        if len(xs) < 2:
-            continue
-        xs.sort()
-        for k in range(0, len(xs) - 1, 2):
-            _span(int(math.ceil(xs[k])), int(math.floor(xs[k + 1])), y, r, g, b, alpha)
+def feather(signed, width):
+    """Coverage of a pixel whose signed distance inside a shape is `signed`.
+
+    Returns 1 well inside the shape, 0 well outside, and a smooth ramp
+    across an edge `width` pixels wide.
+    """
+    return smoothstep(-width, width, signed)
 
 
-def _stamp(cx, cy, rad, r, g, b, alpha):
-    fill_ellipse(cx / SS, cy / SS, rad / SS, rad / SS, (r, g, b), alpha)
+# ---------------------------------------------------------------------------
+# The canvas: a flat list of floats, three per pixel (r, g, b)
+# ---------------------------------------------------------------------------
+
+class Canvas:
+    def __init__(self, size):
+        self.size = size
+        self.pix = [0.0] * (size * size * 3)
+
+    def blend(self, x, y, colour, alpha):
+        """Blend `colour` over pixel (x, y) with opacity `alpha`."""
+        if alpha <= 0.0:
+            return
+        if x < 0 or y < 0 or x >= self.size or y >= self.size:
+            return
+        idx = (y * self.size + x) * 3
+        if alpha >= 1.0:
+            self.pix[idx] = colour[0]
+            self.pix[idx + 1] = colour[1]
+            self.pix[idx + 2] = colour[2]
+        else:
+            keep = 1.0 - alpha
+            self.pix[idx] = colour[0] * alpha + self.pix[idx] * keep
+            self.pix[idx + 1] = colour[1] * alpha + self.pix[idx + 1] * keep
+            self.pix[idx + 2] = colour[2] * alpha + self.pix[idx + 2] * keep
+
+    def fill_vertical_gradient(self, top, bottom):
+        """Paint a smooth top-to-bottom gradient over the whole canvas."""
+        size = self.size
+        for y in range(size):
+            t = y / (size - 1)
+            r = top[0] + (bottom[0] - top[0]) * t
+            g = top[1] + (bottom[1] - top[1]) * t
+            b = top[2] + (bottom[2] - top[2]) * t
+            base = y * size * 3
+            for x in range(size):
+                idx = base + x * 3
+                self.pix[idx] = r
+                self.pix[idx + 1] = g
+                self.pix[idx + 2] = b
+
+    def disc(self, cx, cy, r, colour, alpha=1.0, edge=1.5):
+        """Stamp a filled circle with a soft edge."""
+        x0 = max(0, int(cx - r - edge))
+        x1 = min(self.size - 1, int(cx + r + edge) + 1)
+        y0 = max(0, int(cy - r - edge))
+        y1 = min(self.size - 1, int(cy + r + edge) + 1)
+        for y in range(y0, y1 + 1):
+            dy = y - cy
+            for x in range(x0, x1 + 1):
+                dx = x - cx
+                dist = math.hypot(dx, dy)
+                cov = feather(r - dist, edge)
+                if cov > 0.0:
+                    self.blend(x, y, colour, alpha * cov)
+
+    def ellipse(self, cx, cy, rx, ry, colour, alpha=1.0, edge=1.5):
+        """Stamp a filled ellipse with a soft edge."""
+        x0 = max(0, int(cx - rx - edge))
+        x1 = min(self.size - 1, int(cx + rx + edge) + 1)
+        y0 = max(0, int(cy - ry - edge))
+        y1 = min(self.size - 1, int(cy + ry + edge) + 1)
+        shortest = min(rx, ry)
+        for y in range(y0, y1 + 1):
+            ny = (y - cy) / ry
+            for x in range(x0, x1 + 1):
+                nx = (x - cx) / rx
+                q = math.sqrt(nx * nx + ny * ny)
+                signed = (1.0 - q) * shortest
+                cov = feather(signed, edge)
+                if cov > 0.0:
+                    self.blend(x, y, colour, alpha * cov)
+
+    def polygon(self, points, colour, alpha=1.0, edge=1.5):
+        """Stamp a filled convex polygon with a soft edge.
+
+        A pixel is inside when it lies on the inner side of every edge;
+        the smallest signed distance to an edge gives the coverage ramp.
+        """
+        cx = sum(p[0] for p in points) / len(points)
+        cy = sum(p[1] for p in points) / len(points)
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        x0 = max(0, int(min(xs) - edge))
+        x1 = min(self.size - 1, int(max(xs) + edge) + 1)
+        y0 = max(0, int(min(ys) - edge))
+        y1 = min(self.size - 1, int(max(ys) + edge) + 1)
+        count = len(points)
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                nearest = None
+                for i in range(count):
+                    ax, ay = points[i]
+                    bx, by = points[(i + 1) % count]
+                    ex, ey = bx - ax, by - ay
+                    # Inward normal: the perpendicular that points at the
+                    # polygon's centroid.
+                    nx, ny = -ey, ex
+                    if (cx - ax) * nx + (cy - ay) * ny < 0:
+                        nx, ny = -nx, -ny
+                    length = math.hypot(nx, ny)
+                    d = ((x - ax) * nx + (y - ay) * ny) / length
+                    if nearest is None or d < nearest:
+                        nearest = d
+                cov = feather(nearest, edge)
+                if cov > 0.0:
+                    self.blend(x, y, colour, alpha * cov)
+
+    def segment(self, x1, y1, x2, y2, half, colour, alpha=1.0, edge=1.5):
+        """Stamp a thick straight line with soft ends and edges."""
+        x0 = max(0, int(min(x1, x2) - half - edge))
+        x1b = min(self.size - 1, int(max(x1, x2) + half + edge) + 1)
+        y0 = max(0, int(min(y1, y2) - half - edge))
+        y1b = min(self.size - 1, int(max(y1, y2) + half + edge) + 1)
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+        for y in range(y0, y1b + 1):
+            for x in range(x0, x1b + 1):
+                if length_sq > 0:
+                    t = ((x - x1) * dx + (y - y1) * dy) / length_sq
+                else:
+                    t = 0.0
+                t = max(0.0, min(1.0, t))
+                px = x1 + t * dx
+                py = y1 + t * dy
+                dist = math.hypot(x - px, y - py)
+                cov = feather(half - dist, edge)
+                if cov > 0.0:
+                    self.blend(x, y, colour, alpha * cov)
+
+    def curve(self, p0, p1, p2, half, colour, alpha=1.0, steps=24):
+        """Stamp a thick quadratic Bezier curve as a chain of discs."""
+        for i in range(steps + 1):
+            t = i / steps
+            u = 1.0 - t
+            x = u * u * p0[0] + 2.0 * u * t * p1[0] + t * t * p2[0]
+            y = u * u * p0[1] + 2.0 * u * t * p1[1] + t * t * p2[1]
+            self.disc(x, y, half, colour, alpha, edge=1.5)
+
+    def shade_face(self):
+        """Soft radial light and a faint darker rim over the face disc."""
+        x0 = max(0, FACE_CX - FACE_R)
+        x1 = min(self.size - 1, FACE_CX + FACE_R)
+        y0 = max(0, FACE_CY - FACE_R)
+        y1 = min(self.size - 1, FACE_CY + FACE_R)
+        light_x, light_y = FACE_CX - 42, FACE_CY - 52
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                d = math.hypot(x - FACE_CX, y - FACE_CY)
+                if d >= FACE_R - 6:
+                    continue
+                # Gentle light from the upper left.
+                dl = math.hypot(x - light_x, y - light_y)
+                glow = max(0.0, 1.0 - dl / 215.0)
+                if glow > 0.0:
+                    self.blend(x, y, FACE_LIGHT, 0.45 * glow * glow)
+                # Faint darkening right at the rim.
+                rim = smoothstep(0.80 * FACE_R, 0.985 * FACE_R, d)
+                if rim > 0.0:
+                    self.blend(x, y, FACE_RIM, 0.30 * rim)
 
 
-def thick_line(x0, y0, x1, y1, color, width, alpha=255):
-    """A line drawn as a chain of small discs (round caps, smooth)."""
-    x0, y0, x1, y1 = x0 * SS, y0 * SS, x1 * SS, y1 * SS
-    r, g, b = color
-    rad = width * SS / 2.0
-    dist = math.hypot(x1 - x0, y1 - y0)
-    steps = max(1, int(dist / max(1.0, rad * 0.6)) + 1)
-    for i in range(steps + 1):
-        t = i / steps
-        _stamp(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, rad, r, g, b, alpha)
+# ---------------------------------------------------------------------------
+# The picture, painted shape by shape
+# ---------------------------------------------------------------------------
+
+def draw_eye(canvas, cx, cy):
+    """One big blue eye: dark rim, blue iris, dark pupil, two sparkles."""
+    canvas.ellipse(cx, cy, 40, 54, EYE_RIM)
+    canvas.ellipse(cx, cy, 29, 42, IRIS)
+    canvas.ellipse(cx, cy - 2, 15, 23, PUPIL)
+    canvas.disc(cx - 13, cy - 20, 13, HIGHLIGHT)
+    canvas.disc(cx + 12, cy + 16, 6, HIGHLIGHT)
 
 
-def arc(cx, cy, rad, a0, a1, color, width, alpha=255):
-    """An arc (angles in degrees, 0 = east, increasing clockwise in screen space)."""
-    r, g, b = color
-    steps = max(4, int(abs(a1 - a0) / 6) + 1)
-    prev = None
-    for i in range(steps + 1):
-        a = math.radians(a0 + (a1 - a0) * i / steps)
-        px = cx + rad * math.cos(a)
-        py = cy + rad * math.sin(a)
-        if prev is not None:
-            thick_line(prev[0], prev[1], px, py, color, width, alpha)
-        prev = (px, py)
+def paint():
+    """Paint the whole picture and return the canvas."""
+    canvas = Canvas(SIZE)
+    canvas.fill_vertical_gradient(BG_TOP, BG_BOTTOM)
+
+    # Ears first: the face disc painted next covers their bases, so the
+    # ears look like they grow out of the head. The left ear sits higher
+    # than the right one — that is the head tilt.
+    canvas.polygon([(138, 56), (88, 152), (188, 136)], OUTLINE)
+    canvas.polygon([(377, 80), (325, 142), (425, 154)], OUTLINE)
+    canvas.polygon([(146, 86), (114, 144), (174, 130)], INNER_EAR)
+    canvas.polygon([(370, 106), (338, 142), (396, 150)], INNER_EAR)
+
+    # Face: tan rim, cream fill, then soft shading.
+    canvas.disc(FACE_CX, FACE_CY, FACE_R, OUTLINE)
+    canvas.disc(FACE_CX, FACE_CY, FACE_R - 6, FACE_CREAM)
+    canvas.shade_face()
+
+    # Eyes: the left one a touch higher, following the tilt.
+    draw_eye(canvas, 180, 240)
+    draw_eye(canvas, 335, 250)
+
+    # Blush cheeks, very soft edges.
+    canvas.ellipse(138, 324, 40, 23, BLUSH, alpha=0.55, edge=6.0)
+    canvas.ellipse(374, 334, 40, 23, BLUSH, alpha=0.55, edge=6.0)
+
+    # Nose and the little "w" mouth underneath it.
+    canvas.polygon([(239, 304), (273, 304), (256, 326)], NOSE)
+    canvas.curve((256, 336), (241, 362), (226, 338), 2.4, MOUTH)
+    canvas.curve((256, 336), (271, 362), (286, 338), 2.4, MOUTH)
+
+    # Whiskers, three per cheek, reaching past the face's edge.
+    for x1, y1, x2, y2 in [
+        (120, 282, 52, 262), (116, 308, 46, 306), (122, 336, 56, 356),
+        (392, 282, 460, 262), (396, 308, 466, 306), (390, 336, 456, 356),
+    ]:
+        canvas.segment(x1, y1, x2, y2, 1.4, WHISKER, alpha=0.85)
+
+    # One small pink bow at the base of the right ear.
+    canvas.polygon([(332, 148), (292, 124), (296, 172)], BOW)
+    canvas.polygon([(332, 148), (372, 124), (368, 172)], BOW)
+    canvas.disc(332, 148, 9, BOW_KNOT)
+
+    return canvas
 
 
-def shade_head(cx, cy, rx, ry):
-    """Soft radial depth on the fur: a darker rim and a gentle top-left
-    light. Blends over the cream only, so call it right after the head
-    fill and before any features are drawn."""
-    cx, cy, rx, ry = cx * SS, cy * SS, rx * SS, ry * SS
-    shadow = (238, 198, 166)
-    x0 = max(0, int(cx - rx))
-    x1 = min(SW - 1, int(cx + rx))
-    y0 = max(0, int(cy - ry))
-    y1 = min(SH - 1, int(cy + ry))
-    hx, hy = cx - rx * 0.28, cy - ry * 0.34
-    for y in range(y0, y1 + 1):
-        dy = (y + 0.5 - cy) / ry
-        for x in range(x0, x1 + 1):
-            dx = (x + 0.5 - cx) / rx
-            d2 = dx * dx + dy * dy
-            if d2 >= 1.0:
-                continue
-            # Rim shade grows quadratically past 62% of the radius
-            # (squared-distance falloff, no sqrt needed).
-            if d2 > 0.3844:
-                t = (d2 - 0.3844) / 0.6156
-                a = int(76 * t * t)
-                if a > 0:
-                    _blend(x, y, shadow[0], shadow[1], shadow[2], a)
-            # Soft top-left light.
-            hdx = (x + 0.5 - hx) / (rx * 0.62)
-            hdy = (y + 0.5 - hy) / (ry * 0.62)
-            if abs(hdx) < 1.0 and abs(hdy) < 1.0:
-                hd2 = hdx * hdx + hdy * hdy
-                if hd2 < 1.0:
-                    la = int(26 * (1.0 - math.sqrt(hd2)))
-                    if la > 0:
-                        _blend(x, y, 255, 255, 255, la)
+# ---------------------------------------------------------------------------
+# PNG encoding (standard library only)
+# ---------------------------------------------------------------------------
+
+def _chunk(kind, data):
+    """One PNG chunk: length, type, data, CRC."""
+    out = struct.pack(">I", len(data))
+    out += kind + data
+    out += struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    return out
 
 
-def draw_background():
-    # Vertical pastel gradient only: soft pink at the top, warm cream at
-    # the bottom. Nothing else — the face must stay uncluttered.
-    top = (255, 234, 241)
-    bottom = (255, 247, 233)
-    for y in range(SH):
-        t = y / (SH - 1)
-        r = int(top[0] + (bottom[0] - top[0]) * t)
-        g = int(top[1] + (bottom[1] - top[1]) * t)
-        b = int(top[2] + (bottom[2] - top[2]) * t)
-        i0 = y * SW * 3
-        buf[i0:(y + 1) * SW * 3] = bytes((r, g, b)) * SW
-
-
-def draw_kitten():
-    cream = (255, 244, 227)
-    outline = (232, 180, 140)
-    pink = (242, 125, 150)
-    dark = (67, 48, 43)
-    blush = (255, 159, 178)
-    whisker = (217, 160, 107)
-    mouth_c = (178, 106, 90)
-    blue = (70, 160, 225)
-
-    # Ears (behind the head so the head overlaps their bases). The left
-    # ear sits a little higher than the right: the gentle head tilt.
-    fill_poly([(98, 214), (146, 82), (212, 190)], outline)
-    fill_poly([(414, 220), (366, 92), (300, 196)], outline)
-    fill_poly([(116, 196), (148, 110), (194, 180)], pink)
-    fill_poly([(396, 202), (364, 118), (318, 186)], pink)
-
-    # Head: warm outline, then the cream face, then radial shading.
-    fill_circle(256, 276, 180, outline)
-    fill_circle(256, 276, 172, cream)
-    shade_head(256, 276, 172, 172)
-
-    # One tiny pink bow at the base of the right ear — the single charm
-    # touch, anchored to the ear so it never floats on the face.
-    bow = (242, 102, 139)
-    bow_d = (225, 78, 122)
-    fill_poly([(346, 178), (314, 156), (320, 198)], bow)
-    fill_poly([(346, 178), (378, 156), (372, 198)], bow)
-    fill_circle(346, 178, 9, bow_d)
-
-    # Big bright blue eyes: dark outline, blue iris, dark pupil, white
-    # highlights. The right eye sits a touch lower, part of the head tilt.
-    # The pupils stay smaller than the iris so the blue shows.
-    for ex, ey in ((184, 270), (328, 274)):
-        fill_ellipse(ex, ey, 43, 56, dark)
-        fill_ellipse(ex, ey + 2, 31, 41, blue)
-        fill_ellipse(ex, ey + 2, 17, 26, dark)
-        fill_circle(ex - 13, ey - 17, 14, (255, 255, 255))
-        fill_circle(ex + 14, ey + 19, 6, (255, 255, 255))
-        # Two tiny lash flicks on the outer top edge.
-        thick_line(ex - 34, ey - 44, ex - 45, ey - 57, dark, 3)
-        thick_line(ex - 25, ey - 50, ex - 33, ey - 64, dark, 3)
-
-    # Blush cheeks.
-    fill_ellipse(140, 350, 32, 18, blush, 140)
-    fill_ellipse(372, 354, 32, 18, blush, 140)
-
-    # Tiny pink nose and a little "w" mouth — a soft smile.
-    fill_poly([(238, 320), (274, 320), (256, 342)], pink)
-    fill_circle(256, 338, 7, pink)
-    arc(240, 344, 14, 15, 165, mouth_c, 3)
-    arc(272, 344, 14, 15, 165, mouth_c, 3)
-
-    # Whiskers, short and soft so they never crowd the face.
-    for sx in (-1, 1):
-        thick_line(256 + sx * 100, 302, 256 + sx * 152, 290, whisker, 2.5, 170)
-        thick_line(256 + sx * 102, 324, 256 + sx * 152, 328, whisker, 2.5, 170)
-        thick_line(256 + sx * 100, 346, 256 + sx * 148, 364, whisker, 2.5, 170)
-
-
-def downsample():
-    """Box-average the 2x framebuffer down to 512x512 RGB bytes."""
-    out = bytearray(W * H * 3)
-    for y in range(H):
-        for x in range(W):
-            r = g = b = 0
-            for dy in (0, 1):
-                base = ((y * SS + dy) * SW + x * SS) * 3
-                for dx in (0, 1):
-                    i = base + dx * 3
-                    r += buf[i]
-                    g += buf[i + 1]
-                    b += buf[i + 2]
-            o = (y * W + x) * 3
-            out[o] = (r + 2) // 4
-            out[o + 1] = (g + 2) // 4
-            out[o + 2] = (b + 2) // 4
-    return bytes(out)
-
-
-def png_bytes(rgb, w, h):
-    raw = b"".join(b"\x00" + rgb[y * w * 3:(y + 1) * w * 3] for y in range(h))
-
-    def chunk(tag, data):
-        c = struct.pack(">I", len(data)) + tag + data
-        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-
-    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+def encode_png(canvas):
+    """Serialise the canvas as a 512x512 RGB PNG."""
+    raw = bytearray()
+    stride = SIZE * 3
+    pixels = canvas.pix
+    for y in range(SIZE):
+        raw.append(0)  # filter: none
+        start = y * stride
+        for value in pixels[start:start + stride]:
+            raw.append(max(0, min(255, int(round(value)))))
+    header = struct.pack(">IIBBBBB", SIZE, SIZE, 8, 2, 0, 0, 0)
     return (
         b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", ihdr)
-        + chunk(b"IDAT", zlib.compress(raw, 9))
-        + chunk(b"IEND", b"")
+        + _chunk(b"IHDR", header)
+        + _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+        + _chunk(b"IEND", b"")
     )
 
 
 def main():
-    draw_background()
-    draw_kitten()
-    rgb = downsample()
-    data = png_bytes(rgb, W, H)
+    """Render the kitten and write entry.png into the output directory."""
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "entry.png"), "wb") as f:
-        f.write(data)
+    png = encode_png(paint())
+    with open(os.path.join(out_dir, "entry.png"), "wb") as handle:
+        handle.write(png)
 
 
 if __name__ == "__main__":
