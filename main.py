@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Cutest picture v2: a cream kitten hugging a tiny yellow chick.
+"""Cutest picture v3: one big cream kitten face, drawn better.
 
 The program draws the picture itself (no bundled image, no network, no
 third-party libraries) and writes it deterministically to
 $MAKEFUN_OUTPUT_DIR/entry.png (default /output/entry.png).
 
-The pair fills the frame so it reads clearly at ~300px: a big cream kitten
-with a gentle head tilt, big bright blue eyes and a small mint scarf, its
-clumsy paws wrapped around a tiny yellow chick with big blue eyes, a tiny
-orange beak and a feather tuft. Soft blush on both, calm uncluttered
-background.
+Lesson from v1 and v2: v1 (one big kitten face, pink bow) scored 73.6%;
+v2 (kitten hugging a chick, two subjects) scored 66.5% — the second
+subject crowded the frame and hurt "reads small" and clean craft. So v3
+goes back to ONE large subject filling the frame, and spends the effort
+on making that one face better: bigger bright blue eyes, a gentle head
+tilt, a soft smile, one tiny pink bow only, and soft radial shading on
+the fur for depth (darker rim, gentle top-left light).
 
 Technique: a small scanline rasteriser draws filled ellipses, polygons and
 thick lines into a 2x supersampled framebuffer, which is then box-downsampled
@@ -133,27 +135,46 @@ def arc(cx, cy, rad, a0, a1, color, width, alpha=255):
         prev = (px, py)
 
 
-def heart(cx, cy, s, color, alpha=255):
-    """A small heart centred near (cx, cy), size s."""
-    fill_circle(cx - s * 0.38, cy - s * 0.18, s * 0.40, color, alpha)
-    fill_circle(cx + s * 0.38, cy - s * 0.18, s * 0.40, color, alpha)
-    fill_poly(
-        [(cx - s * 0.72, cy - s * 0.05), (cx + s * 0.72, cy - s * 0.05),
-         (cx, cy + s * 0.85)],
-        color, alpha,
-    )
-
-
-def _lcg(seed):
-    x = seed
-    while True:
-        x = (1103515245 * x + 12345) & 0x7FFFFFFF
-        yield x
+def shade_head(cx, cy, rx, ry):
+    """Soft radial depth on the fur: a darker rim and a gentle top-left
+    light. Blends over the cream only, so call it right after the head
+    fill and before any features are drawn."""
+    cx, cy, rx, ry = cx * SS, cy * SS, rx * SS, ry * SS
+    shadow = (238, 198, 166)
+    x0 = max(0, int(cx - rx))
+    x1 = min(SW - 1, int(cx + rx))
+    y0 = max(0, int(cy - ry))
+    y1 = min(SH - 1, int(cy + ry))
+    hx, hy = cx - rx * 0.28, cy - ry * 0.34
+    for y in range(y0, y1 + 1):
+        dy = (y + 0.5 - cy) / ry
+        for x in range(x0, x1 + 1):
+            dx = (x + 0.5 - cx) / rx
+            d2 = dx * dx + dy * dy
+            if d2 >= 1.0:
+                continue
+            # Rim shade grows quadratically past 62% of the radius
+            # (squared-distance falloff, no sqrt needed).
+            if d2 > 0.3844:
+                t = (d2 - 0.3844) / 0.6156
+                a = int(76 * t * t)
+                if a > 0:
+                    _blend(x, y, shadow[0], shadow[1], shadow[2], a)
+            # Soft top-left light.
+            hdx = (x + 0.5 - hx) / (rx * 0.62)
+            hdy = (y + 0.5 - hy) / (ry * 0.62)
+            if abs(hdx) < 1.0 and abs(hdy) < 1.0:
+                hd2 = hdx * hdx + hdy * hdy
+                if hd2 < 1.0:
+                    la = int(26 * (1.0 - math.sqrt(hd2)))
+                    if la > 0:
+                        _blend(x, y, 255, 255, 255, la)
 
 
 def draw_background():
-    # Vertical gradient: soft periwinkle at the top, warm cream at the bottom.
-    top = (233, 239, 253)
+    # Vertical pastel gradient only: soft pink at the top, warm cream at
+    # the bottom. Nothing else — the face must stay uncluttered.
+    top = (255, 234, 241)
     bottom = (255, 247, 233)
     for y in range(SH):
         t = y / (SH - 1)
@@ -162,13 +183,6 @@ def draw_background():
         b = int(top[2] + (bottom[2] - top[2]) * t)
         i0 = y * SW * 3
         buf[i0:(y + 1) * SW * 3] = bytes((r, g, b)) * SW
-    # A few faint white dots, fixed positions from a seeded generator.
-    rng = _lcg(20261113)
-    for _ in range(12):
-        x = 24 + next(rng) % 464
-        y = 24 + next(rng) % 464
-        rad = 4 + next(rng) % 7
-        fill_circle(x, y, rad, (255, 255, 255), 60)
 
 
 def draw_kitten():
@@ -180,115 +194,55 @@ def draw_kitten():
     whisker = (217, 160, 107)
     mouth_c = (178, 106, 90)
     blue = (70, 160, 225)
-    mint = (168, 220, 190)
-    mint_d = (140, 198, 166)
 
-    # Soft ground shadow.
-    fill_ellipse(256, 468, 150, 12, (228, 200, 192), 80)
+    # Ears (behind the head so the head overlaps their bases). The left
+    # ear sits a little higher than the right: the gentle head tilt.
+    fill_poly([(98, 214), (146, 82), (212, 190)], outline)
+    fill_poly([(414, 220), (366, 92), (300, 196)], outline)
+    fill_poly([(116, 196), (148, 110), (194, 180)], pink)
+    fill_poly([(396, 202), (364, 118), (318, 186)], pink)
 
-    # Ears (behind the head so the head overlaps their bases).
-    # Left ear sits a little higher than the right: the gentle head tilt.
-    fill_poly([(126, 192), (168, 80), (222, 168)], outline)
-    fill_poly([(398, 198), (360, 92), (312, 172)], outline)
-    fill_poly([(144, 174), (170, 106), (204, 162)], pink)
-    fill_poly([(382, 180), (358, 116), (326, 168)], pink)
+    # Head: warm outline, then the cream face, then radial shading.
+    fill_circle(256, 276, 180, outline)
+    fill_circle(256, 276, 172, cream)
+    shade_head(256, 276, 172, 172)
 
-    # Head: warm outline, then the cream face.
-    fill_circle(252, 262, 158, outline)
-    fill_circle(252, 262, 150, cream)
+    # One tiny pink bow at the base of the right ear — the single charm
+    # touch, anchored to the ear so it never floats on the face.
+    bow = (242, 102, 139)
+    bow_d = (225, 78, 122)
+    fill_poly([(346, 178), (314, 156), (320, 198)], bow)
+    fill_poly([(346, 178), (378, 156), (372, 198)], bow)
+    fill_circle(346, 178, 9, bow_d)
 
     # Big bright blue eyes: dark outline, blue iris, dark pupil, white
     # highlights. The right eye sits a touch lower, part of the head tilt.
-    for ex, ey in ((196, 250), (316, 256)):
-        fill_ellipse(ex, ey, 34, 44, dark)
-        fill_ellipse(ex, ey + 2, 25, 33, blue)
-        fill_ellipse(ex, ey + 2, 13, 19, dark)
-        fill_circle(ex - 10, ey - 14, 11, (255, 255, 255))
-        fill_circle(ex + 11, ey + 13, 5, (255, 255, 255))
+    # The pupils stay smaller than the iris so the blue shows.
+    for ex, ey in ((184, 270), (328, 274)):
+        fill_ellipse(ex, ey, 43, 56, dark)
+        fill_ellipse(ex, ey + 2, 31, 41, blue)
+        fill_ellipse(ex, ey + 2, 17, 26, dark)
+        fill_circle(ex - 13, ey - 17, 14, (255, 255, 255))
+        fill_circle(ex + 14, ey + 19, 6, (255, 255, 255))
         # Two tiny lash flicks on the outer top edge.
-        thick_line(ex - 28, ey - 34, ex - 38, ey - 46, dark, 3)
-        thick_line(ex - 20, ey - 40, ex - 28, ey - 54, dark, 3)
+        thick_line(ex - 34, ey - 44, ex - 45, ey - 57, dark, 3)
+        thick_line(ex - 25, ey - 50, ex - 33, ey - 64, dark, 3)
 
     # Blush cheeks.
-    fill_ellipse(148, 336, 26, 14, blush, 140)
-    fill_ellipse(358, 340, 26, 14, blush, 140)
+    fill_ellipse(140, 350, 32, 18, blush, 140)
+    fill_ellipse(372, 354, 32, 18, blush, 140)
 
-    # Tiny pink nose and a little "w" mouth.
-    fill_poly([(236, 314), (268, 314), (252, 332)], pink)
-    fill_circle(252, 328, 7, pink)
-    arc(238, 334, 13, 15, 165, mouth_c, 3)
-    arc(266, 334, 13, 15, 165, mouth_c, 3)
+    # Tiny pink nose and a little "w" mouth — a soft smile.
+    fill_poly([(238, 320), (274, 320), (256, 342)], pink)
+    fill_circle(256, 338, 7, pink)
+    arc(240, 344, 14, 15, 165, mouth_c, 3)
+    arc(272, 344, 14, 15, 165, mouth_c, 3)
 
-    # Whiskers.
+    # Whiskers, short and soft so they never crowd the face.
     for sx in (-1, 1):
-        thick_line(252 + sx * 104, 300, 252 + sx * 158, 288, whisker, 2.5, 180)
-        thick_line(252 + sx * 106, 322, 252 + sx * 158, 326, whisker, 2.5, 180)
-        thick_line(252 + sx * 104, 344, 252 + sx * 154, 362, whisker, 2.5, 180)
-
-    # Small mint scarf around the neck: band, knot on the left, two short
-    # tails splayed outward so they read as scarf tails, not legs.
-    thick_line(150, 408, 354, 408, mint, 26)
-    fill_circle(185, 412, 14, mint_d)
-    thick_line(178, 420, 160, 442, mint, 15)
-    thick_line(194, 420, 210, 440, mint, 15)
-
-
-def draw_chick():
-    yellow = (255, 214, 90)
-    yellow_d = (244, 196, 72)
-    orange = (255, 150, 60)
-    dark = (67, 48, 43)
-    blue = (90, 175, 235)
-    blush = (255, 159, 178)
-
-    # Round chubby body, tucked against the kitten's cheek.
-    fill_ellipse(345, 385, 52, 58, yellow_d)
-    fill_ellipse(345, 385, 48, 54, yellow)
-
-    # Feather tuft on top.
-    thick_line(345, 332, 335, 312, yellow_d, 4)
-    thick_line(345, 330, 345, 308, yellow_d, 4)
-    thick_line(345, 332, 355, 312, yellow_d, 4)
-
-    # Little wing on the chick's left side.
-    fill_ellipse(308, 408, 12, 20, yellow_d)
-
-    # Big bright blue eyes.
-    for ex in (326, 362):
-        fill_ellipse(ex, 370, 11, 13, dark)
-        fill_ellipse(ex, 371, 8, 10, blue)
-        fill_ellipse(ex, 371, 4, 5, dark)
-        fill_circle(ex - 3, 366, 3, (255, 255, 255))
-
-    # Tiny orange beak.
-    fill_poly([(330, 388), (356, 388), (343, 404)], orange)
-    fill_poly([(334, 396), (352, 396), (343, 406)], (230, 120, 45))
-
-    # Blush on the chick's cheek.
-    fill_ellipse(318, 398, 10, 6, blush, 160)
-
-    # Tiny orange feet peeking out below the body.
-    fill_ellipse(332, 446, 9, 5, orange)
-    fill_ellipse(360, 446, 9, 5, orange)
-
-
-def draw_paws():
-    cream = (255, 244, 227)
-    outline = (232, 180, 140)
-
-    # The kitten's clumsy paws wrapped around the chick, in front of it.
-    # Toe lines slant inward, toward the chick, so the paws read as
-    # gripping it rather than sitting beside it.
-    for px, s in ((296, 1), (394, -1)):
-        fill_ellipse(px, 422, 34, 20, outline)
-        fill_ellipse(px, 420, 30, 17, cream)
-        thick_line(px - 12 * s, 408, px - 8 * s, 428, outline, 2)
-        thick_line(px + 8 * s, 408, px + 12 * s, 428, outline, 2)
-
-
-def draw_hearts():
-    heart(76, 92, 16, (255, 143, 171), 180)
-    heart(436, 78, 20, (255, 143, 171), 180)
+        thick_line(256 + sx * 100, 302, 256 + sx * 152, 290, whisker, 2.5, 170)
+        thick_line(256 + sx * 102, 324, 256 + sx * 152, 328, whisker, 2.5, 170)
+        thick_line(256 + sx * 100, 346, 256 + sx * 148, 364, whisker, 2.5, 170)
 
 
 def downsample():
@@ -330,9 +284,6 @@ def png_bytes(rgb, w, h):
 def main():
     draw_background()
     draw_kitten()
-    draw_chick()
-    draw_paws()
-    draw_hearts()
     rgb = downsample()
     data = png_bytes(rgb, W, H)
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
